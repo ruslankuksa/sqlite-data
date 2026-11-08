@@ -780,9 +780,14 @@
       previousRecordTypeByTableName: [String: RecordType],
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
-      let tablesWithChangedSchemas = currentRecordTypeByTableName.filter { tableName, recordType in
-        previousRecordTypeByTableName[tableName]?.schema != recordType.schema
-      }
+      let tablesWithChangedSchemas =
+        currentRecordTypeByTableName
+        .filter { tableName, recordType in
+          previousRecordTypeByTableName[tableName]?.schema != recordType.schema
+        }
+        .sorted { lhs, rhs in
+          topologicallyAscending(lhsTableName: lhs.key, rhsTableName: rhs.key, rootFirst: true)
+        }
 
       for (tableName, currentRecordType) in tablesWithChangedSchemas {
         guard let table = tablesByName[tableName]
@@ -822,14 +827,34 @@
             }
           }
           for case .some(let lastKnownServerRecord) in lastKnownServerRecords {
+            let record = refreshedRecords[lastKnownServerRecord.recordID] ?? lastKnownServerRecord
             let query = updateQuery(
               for: table,
-              record: refreshedRecords[lastKnownServerRecord.recordID] ?? lastKnownServerRecord,
+              record: record,
               columnNames: T.TableColumns.writableColumns.map(\.name),
               changedColumnNames: changedColumns
             )
             try await userDatabase.write { db in
-              try #sql(query).execute(db)
+              do {
+                try #sql(query).execute(db)
+              } catch {
+                guard
+                  let error = error as? DatabaseError,
+                  error.resultCode == .SQLITE_CONSTRAINT,
+                  error.extendedResultCode == .SQLITE_CONSTRAINT_FOREIGNKEY
+                else {
+                  throw error
+                }
+                try UnsyncedRecordID.insert {
+                  UnsyncedRecordID(record: record)
+                } onConflict: {
+                  ($0.recordName, $0.zoneName, $0.ownerName)
+                } doUpdate: {
+                  $0.assets = $1.assets
+                  $0.record = $1.record
+                }
+                .execute(db)
+              }
             }
           }
         }

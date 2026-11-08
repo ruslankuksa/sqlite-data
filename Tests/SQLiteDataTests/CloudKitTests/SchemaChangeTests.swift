@@ -940,6 +940,162 @@
           """
         }
       }
+
+      /*
+       * Old device, without the "households" and "discountCards" tables, receives a household
+       * record and a discount card record that references it.
+       * App upgrades and creates both tables, with "discountCards" referencing "households".
+       => Both records are written locally when the sync engine starts.
+       */
+      // NB: Without a dependency order, the new tables are processed in 'Dictionary' order, which
+      //     is seeded per process and per allocation, so table names can't pin it. Each attempt
+      //     builds a fresh sync engine, so the child-first order is all but certain to be hit.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: 1...10)
+      func newParentAndChildTables(attempt _: Int) async throws {
+        try await withDependencies {
+          $0.currentTime.now += 60
+        } operation: {
+          let householdRecord = householdRecord()
+          try await syncEngine.modifyRecords(
+            scope: .private,
+            saving: [householdRecord, discountCardRecord(household: householdRecord)]
+          )
+          .notify()
+          syncEngine.stop()
+
+          let relaunchedSyncEngine = try await relaunchWithHouseholdTables()
+          defer { _ = relaunchedSyncEngine }
+
+          try await userDatabase.read { db in
+            expectNoDifference(try Household.fetchAll(db), [Household(id: 1, name: "Home")])
+            expectNoDifference(
+              try DiscountCard.fetchAll(db),
+              [DiscountCard(id: 1, householdID: 1, number: "1234")]
+            )
+          }
+          try await relaunchedSyncEngine.metadatabase.read { db in
+            try #expect(UnsyncedRecordID.count().fetchOne(db) == 0)
+            try #expect(Self.cachedHouseholdRecordTypeCount(db) == 2)
+          }
+        }
+      }
+
+      /*
+       * Old device, without the "households" and "discountCards" tables, receives a discount card
+       * record but not yet the household record it references.
+       * App upgrades and creates both tables.
+       => The sync engine still starts and caches the new schema.
+       * Household record arrives.
+       => Discount card record is retried and written locally.
+       */
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func newChildTableWithoutParentRecord() async throws {
+        try await withDependencies {
+          $0.currentTime.now += 60
+        } operation: {
+          let householdRecord = householdRecord()
+          _ = try syncEngine.modifyRecords(scope: .private, saving: [householdRecord])
+          try await syncEngine.modifyRecords(
+            scope: .private,
+            saving: [discountCardRecord(household: householdRecord)]
+          )
+          .notify()
+          syncEngine.stop()
+
+          let relaunchedSyncEngine = try await relaunchWithHouseholdTables()
+          defer { _ = relaunchedSyncEngine }
+
+          try await userDatabase.read { db in
+            try #expect(DiscountCard.fetchCount(db) == 0)
+          }
+          try await relaunchedSyncEngine.metadatabase.read { db in
+            let unsyncedRecords = try UnsyncedRecordID.all.fetchAll(db)
+            #expect(
+              unsyncedRecords.map(\.recordName) == [DiscountCard.recordID(for: 1).recordName]
+            )
+            #expect(unsyncedRecords.first?.record?.encryptedValues["number"] as? String == "1234")
+            try #expect(Self.cachedHouseholdRecordTypeCount(db) == 2)
+          }
+
+          let freshHouseholdRecord = try relaunchedSyncEngine.private.database.record(
+            for: Household.recordID(for: 1)
+          )
+          try await relaunchedSyncEngine
+            .modifyRecords(scope: .private, saving: [freshHouseholdRecord])
+            .notify()
+
+          try await userDatabase.read { db in
+            expectNoDifference(try Household.fetchAll(db), [Household(id: 1, name: "Home")])
+            expectNoDifference(
+              try DiscountCard.fetchAll(db),
+              [DiscountCard(id: 1, householdID: 1, number: "1234")]
+            )
+          }
+          try await relaunchedSyncEngine.metadatabase.read { db in
+            try #expect(UnsyncedRecordID.count().fetchOne(db) == 0)
+          }
+        }
+      }
+
+      private func householdRecord() -> CKRecord {
+        let record = CKRecord(recordType: Household.tableName, recordID: Household.recordID(for: 1))
+        record.setValue(1, forKey: "id", at: now)
+        record.setValue("Home", forKey: "name", at: now)
+        return record
+      }
+
+      private func discountCardRecord(household: CKRecord) -> CKRecord {
+        let record = CKRecord(
+          recordType: DiscountCard.tableName,
+          recordID: DiscountCard.recordID(for: 1)
+        )
+        record.setValue(1, forKey: "id", at: now)
+        record.setValue(1, forKey: "householdID", at: now)
+        record.setValue("1234", forKey: "number", at: now)
+        record.parent = CKRecord.Reference(record: household, action: .none)
+        return record
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      private func relaunchWithHouseholdTables() async throws -> SyncEngine {
+        try await userDatabase.userWrite { db in
+          try #sql(
+            """
+            CREATE TABLE "households" (
+              "id" INTEGER PRIMARY KEY NOT NULL,
+              "name" TEXT NOT NULL
+            ) STRICT
+            """
+          )
+          .execute(db)
+          try #sql(
+            """
+            CREATE TABLE "discountCards" (
+              "id" INTEGER PRIMARY KEY NOT NULL,
+              "householdID" INTEGER NOT NULL REFERENCES "households"("id") ON DELETE CASCADE,
+              "number" TEXT NOT NULL
+            ) STRICT
+            """
+          )
+          .execute(db)
+        }
+        return try await SyncEngine(
+          container: syncEngine.container,
+          userDatabase: syncEngine.userDatabase,
+          tables: syncEngine.tables + [
+            SynchronizedTable(for: DiscountCard.self),
+            SynchronizedTable(for: Household.self),
+          ],
+          privateTables: syncEngine.privateTables
+        )
+      }
+
+      private static func cachedHouseholdRecordTypeCount(_ db: Database) throws -> Int {
+        try RecordType
+          .where { $0.tableName.in([Household.tableName, DiscountCard.tableName]) }
+          .fetchCount(db)
+      }
     }
   }
 
@@ -977,5 +1133,18 @@ private struct RemindersListWithPosition: Equatable, Identifiable {
     let id: Int
     var image: Data
     var caption = ""
+  }
+
+  @Table
+  private struct Household: Equatable, Identifiable {
+    let id: Int
+    var name = ""
+  }
+
+  @Table
+  private struct DiscountCard: Equatable, Identifiable {
+    let id: Int
+    var householdID: Household.ID
+    var number = ""
   }
 #endif
